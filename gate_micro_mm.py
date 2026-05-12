@@ -116,6 +116,13 @@ class Config:
     skew_threshold:    int = 2000
     skew_reduction:    float = 0.5   # fraction of notional to apply above threshold
 
+    # Profitability
+    min_spread_ticks:     int     = 2      # skip symbols where spread < N ticks
+    price_skew_max_ticks: int     = 3      # max tick shift to lean quotes vs inventory
+    momentum_window:      int     = 12     # mid-price samples used for trend detection
+    momentum_threshold:   float   = 0.0004 # fractional momentum to suppress one side
+    min_volume_usdt:      Decimal = Decimal(os.getenv("MM_MIN_VOLUME_USDT", "50000"))
+
     # WS
     ws_reconnect_delay: float = 3.0
     ws_max_retries:     int   = 100
@@ -737,6 +744,7 @@ class QuoteEngine:
         self._bid_px:   Optional[Decimal] = None
         self._ask_px:   Optional[Decimal] = None
         self._last_refresh: float         = 0.0
+        self._mid_history: Deque[Decimal] = deque(maxlen=cfg.momentum_window)
 
     async def refresh(self) -> None:
         """Called on each market tick / timer. Places or replaces quotes."""
@@ -749,28 +757,57 @@ class QuoteEngine:
         if not bb or not ba:
             return  # no book yet
 
-        tick      = self._inst.tick
-        inv       = await self._risk.inventory(self.symbol)
-        notional  = self._effective_notional(inv)
-        qty       = self._inst.qty_from_notional(notional)
+        tick = self._inst.tick
+
+        # Spread guard: skip markets too tight to be profitable
+        if (ba - bb) < tick * self._cfg.min_spread_ticks:
+            await self._cancel_both()
+            return
+
+        # Momentum filter: suppress the adverse-selection side during trends
+        mid = (bb + ba) / 2
+        self._mid_history.append(mid)
+        suppress_bid = suppress_ask = False
+        if len(self._mid_history) == self._cfg.momentum_window:
+            momentum = float(
+                (self._mid_history[-1] - self._mid_history[0]) / self._mid_history[0]
+            )
+            if momentum > self._cfg.momentum_threshold:
+                suppress_bid = True   # rising price: avoid buying into the trend
+            elif momentum < -self._cfg.momentum_threshold:
+                suppress_ask = True   # falling price: avoid selling into the trend
+
+        inv      = await self._risk.inventory(self.symbol)
+        notional = self._effective_notional(inv)
+        qty      = self._inst.qty_from_notional(notional)
         if qty <= 0:
             return
 
-        # Target prices: join inside market (never cross)
-        target_bid = self._inst.round_price(bb, "buy")
-        target_ask = self._inst.round_price(ba, "sell")
+        # Inventory price skew: shift both quotes toward reducing exposure.
+        # Long inventory → shift down (aggressive ask, passive bid).
+        # Short inventory → shift up (aggressive bid, passive ask).
+        skew_frac  = max(-1.0, min(1.0, inv / self._cfg.max_inventory))
+        tick_shift = tick * int(skew_frac * self._cfg.price_skew_max_ticks)
+
+        target_bid = self._inst.round_price(bb - tick_shift, "buy")
+        target_ask = self._inst.round_price(ba - tick_shift, "sell")
 
         if target_bid >= target_ask:
-            return  # degenerate book
+            return  # degenerate after skew
 
-        now = time.monotonic()
+        now      = time.monotonic()
         need_bid = self._needs_replace(self._bid_px, target_bid, tick)
         need_ask = self._needs_replace(self._ask_px, target_ask, tick)
         forced   = (now - self._last_refresh) >= self._cfg.refresh_secs
 
-        if need_bid or forced:
+        if suppress_bid:
+            await self._cancel_side("buy")
+        elif need_bid or forced:
             await self._replace_side("buy", target_bid, qty)
-        if need_ask or forced:
+
+        if suppress_ask:
+            await self._cancel_side("sell")
+        elif need_ask or forced:
             await self._replace_side("sell", target_ask, qty)
 
         self._last_refresh = now
@@ -845,6 +882,22 @@ class QuoteEngine:
 
         log.debug("QUOTE  %s  %s  qty=%d  px=%s  id=%s",
                   self.symbol, side.upper(), qty, price, oid)
+
+    async def _cancel_side(self, side: str) -> None:
+        oid = self._bid_id if side == "buy" else self._ask_id
+        if not oid:
+            return
+        try:
+            await self._rest.cancel_order(oid)
+        except Exception:
+            pass
+        await self._oms.on_cancel(oid)
+        if side == "buy":
+            self._bid_id = None
+            self._bid_px = None
+        else:
+            self._ask_id = None
+            self._ask_px = None
 
     async def _cancel_both(self) -> None:
         for oid in [self._bid_id, self._ask_id]:
@@ -997,9 +1050,13 @@ async def discover_symbols(rest: GateRest, cfg: Config) -> Tuple[
         in_tr = c.get("in_delisting", False)
         trade_status = c.get("trade_status", "")
 
+        vol = Decimal(str(c.get("volume_24h_quote", "0") or "0"))
+
         if in_tr or trade_status != "tradable":
             continue
         if mark <= 0:
+            continue
+        if vol < cfg.min_volume_usdt:
             continue
         if cfg.price_min <= mark <= cfg.price_max:
             instruments[sym] = Instrument(
