@@ -34,6 +34,9 @@ ENVIRONMENT VARIABLES (all optional)
   GATE_API_SECRET           API secret
   MM_SYMBOLS                Comma-separated override, e.g. SHIB_USDT,PEPE_USDT
   MM_MAX_SYMBOLS            Cap auto-discovered universe to top-N by volume (default 8)
+  MM_DRY_RUN                1/true → paper/walk-forward: live data, NO real orders
+  MM_PAPER_EQUITY          Simulated starting equity for dry run (default 100.0)
+  MM_START_PNL             Seed P&L for dry run, e.g. -36 to model a drawdown (default 0)
   MM_NOTIONAL_USDT          Per-side order size in USDT (default 5.0)
   MM_PRICE_MIN              Min contract price to auto-discover (default 0.000001)
   MM_PRICE_MAX              Max contract price to auto-discover (default 0.01 = sub-penny)
@@ -130,6 +133,12 @@ class Config:
     # Cap the auto-discovered universe to the top-N by 24h volume (5–10 tickers).
     max_symbols: int = int(os.getenv("MM_MAX_SYMBOLS", "8"))
 
+    # Dry-run / paper / walk-forward mode: live public data, simulated fills,
+    # ZERO real orders. No API keys required.
+    dry_run:      bool    = os.getenv("MM_DRY_RUN", "0").lower() in ("1", "true", "yes")
+    paper_equity: Decimal = Decimal(os.getenv("MM_PAPER_EQUITY", "100.0"))
+    start_pnl:    Decimal = Decimal(os.getenv("MM_START_PNL", "0.0"))  # e.g. -36 to model a drawdown
+
     # Symbols (None → auto-discover)
     symbols: Optional[List[str]] = None
 
@@ -210,6 +219,7 @@ class GateRest:
         self._cfg     = cfg
         self._session = session
         self._sem     = asyncio.Semaphore(4)
+        self._dry     = cfg.dry_run
 
     async def _call(self, method: str, path: str,
                     params: Optional[dict] = None,
@@ -252,6 +262,8 @@ class GateRest:
 
     # ── Private ─────────────────────────────────
     async def get_account(self) -> dict:
+        if self._dry:
+            return {"available": str(self._cfg.paper_equity), "total": str(self._cfg.paper_equity)}
         return await self._call("GET", f"/api/v4/futures/{SETTLE}/accounts")  # type: ignore
 
     async def get_positions(self) -> list:
@@ -263,6 +275,10 @@ class GateRest:
 
     async def place_order(self, symbol: str, size: int, price: Decimal,
                           tif: str = "poc") -> dict:
+        if self._dry:
+            # Paper order: never hits the exchange. Return a synthetic ack.
+            return {"id": f"paper-{uuid.uuid4().hex[:12]}", "status": "open",
+                    "contract": symbol, "size": size, "price": str(price)}
         payload = {
             "contract": symbol,
             "size":     size,           # positive=buy, negative=sell
@@ -276,10 +292,14 @@ class GateRest:
                                 payload=payload)  # type: ignore
 
     async def cancel_order(self, order_id: str) -> dict:
+        if self._dry:
+            return {"id": order_id, "status": "cancelled"}
         return await self._call("DELETE",
                                 f"/api/v4/futures/{SETTLE}/orders/{order_id}")  # type: ignore
 
     async def cancel_all(self, symbol: str) -> list:
+        if self._dry:
+            return []
         return await self._call("DELETE", f"/api/v4/futures/{SETTLE}/orders",
                                 params={"contract": symbol})  # type: ignore
 
@@ -550,7 +570,13 @@ class RiskLedger:
                         f"daily={float(pos.daily_pnl):+.4f}"
                     )
                     total_realized += pos.realized
-            lines.append(f"  {'TOTAL':25s}  realized={float(total_realized):+.4f}")
+            start = self._cfg.start_pnl
+            net   = start + total_realized
+            lines.append(
+                f"  {'TOTAL':25s}  start={float(start):+.4f}  "
+                f"session_realized={float(total_realized):+.4f}  "
+                f"net={float(net):+.4f}"
+            )
             return "\n".join(lines)
 
 
@@ -560,10 +586,12 @@ class RiskLedger:
 class PublicWS:
     """Subscribes to order_book updates for all tracked symbols."""
 
-    def __init__(self, symbols: List[str], books: Dict[str, OrderBook]):
-        self._symbols = symbols
-        self._books   = books
-        self.shutdown = False
+    def __init__(self, symbols: List[str], books: Dict[str, OrderBook],
+                 trade_cb=None):
+        self._symbols  = symbols
+        self._books    = books
+        self._trade_cb = trade_cb   # async (symbol, price: Decimal, taker_side: str)
+        self.shutdown  = False
 
     async def run(self) -> None:
         retries = 0
@@ -584,6 +612,15 @@ class PublicWS:
                         }
                         await ws.send(json.dumps(sub))
                         await asyncio.sleep(0.05)
+                        # Trades feed: only needed to drive paper-fill simulation.
+                        if self._trade_cb is not None:
+                            await ws.send(json.dumps({
+                                "time":    int(time.time()),
+                                "channel": "futures.trades",
+                                "event":   "subscribe",
+                                "payload": [sym],
+                            }))
+                            await asyncio.sleep(0.05)
                     log.info("PublicWS subscribed to %d symbols", len(self._symbols))
 
                     async for raw in ws:
@@ -593,7 +630,7 @@ class PublicWS:
                             msg = json.loads(raw)
                         except json.JSONDecodeError:
                             continue
-                        self._dispatch(msg)
+                        await self._dispatch(msg)
 
             except (websockets.WebSocketException, OSError, asyncio.TimeoutError) as exc:
                 retries += 1
@@ -602,9 +639,26 @@ class PublicWS:
                             exc, retries, delay)
                 await asyncio.sleep(delay)
 
-    def _dispatch(self, msg: dict) -> None:
+    async def _dispatch(self, msg: dict) -> None:
         ch = msg.get("channel", "")
         ev = msg.get("event", "")
+
+        if ch == "futures.trades" and self._trade_cb is not None:
+            result = msg.get("result", [])
+            trades = result if isinstance(result, list) else [result]
+            for t in trades:
+                sym = t.get("contract", "")
+                if sym not in self._books:
+                    continue
+                try:
+                    price = Decimal(str(t.get("price", "0")))
+                except Exception:
+                    continue
+                # Gate: size > 0 → taker BUY (lifts ask); size < 0 → taker SELL (hits bid)
+                taker_side = "buy" if int(t.get("size", 0)) > 0 else "sell"
+                await self._trade_cb(sym, price, taker_side)
+            return
+
         if ch != "futures.order_book":
             return
         result = msg.get("result", {})
@@ -622,6 +676,56 @@ class PublicWS:
                 "b": [[x["p"], x["s"]] for x in result.get("bids", [])],
                 "a": [[x["p"], x["s"]] for x in result.get("asks", [])],
             })
+
+
+# ─────────────────────────────────────────────
+#  Paper Broker (dry-run fill simulation)
+# ─────────────────────────────────────────────
+class PaperBroker:
+    """
+    Simulates MAKER fills for dry-run / walk-forward testing.
+
+    A resting post-only quote fills only when a real taker trade prints
+    *through* its price (the conservative, realistic maker assumption):
+      • taker SELL at P  → fills our resting BUY  orders priced >= P
+      • taker BUY  at P  → fills our resting SELL orders priced <= P
+
+    Fills feed the SAME OMS / RiskLedger / on_fill callbacks the live
+    PrivateWS would, so P&L accounting is identical to production.
+    """
+
+    def __init__(self, cfg: Config, oms: OMS, risk: RiskLedger):
+        self._cfg  = cfg
+        self._oms  = oms
+        self._risk = risk
+        self._fill_callbacks: List = []
+        self.fills = 0
+
+    def on_fill(self, cb) -> None:
+        self._fill_callbacks.append(cb)
+
+    async def on_trade(self, symbol: str, price: Decimal, taker_side: str) -> None:
+        open_orders = await self._oms.get_open(symbol)
+        for oid, o in open_orders.items():
+            crossed = (
+                (o.side == "buy"  and taker_side == "sell" and price <= o.price) or
+                (o.side == "sell" and taker_side == "buy"  and price >= o.price)
+            )
+            if crossed:
+                await self._fill(o)
+
+    async def _fill(self, o: LiveOrder) -> None:
+        await self._oms.on_fill(o.order_id)
+        await self._risk.record_fill(o.symbol, o.side, o.size, o.price)
+        self.fills += 1
+        rebate = abs(MAKER_FEE) * o.price * Decimal(o.size)  # positive = rebate earned
+        log.info("PAPER-FILL  %s  %s  qty=%d  px=%s  rebate≈%.6f  id=%s",
+                 o.symbol, o.side.upper(), o.size, o.price, float(rebate), o.order_id)
+        for cb in self._fill_callbacks:
+            try:
+                await cb(o.symbol, o.side, o.size, o.price)
+            except Exception as exc:
+                log.error("paper fill_callback error: %s", exc)
 
 
 # ─────────────────────────────────────────────
@@ -1177,21 +1281,37 @@ class MicroMM:
                     book       = books[sym],
                 )
 
-            # ── cancel existing open orders ───────
-            log.info("Cancelling any existing open orders...")
-            await rest.cancel_all_symbols(symbols)
-            await asyncio.sleep(1.0)
+            dry = self._cfg.dry_run
+            private_ws: Optional[PrivateWS]  = None
+            paper:      Optional[PaperBroker] = None
 
-            # ── reconcile positions ───────────────
-            await reconcile(rest, risk, symbols)
+            if dry:
+                log.warning("════════════════════════════════════════════════════")
+                log.warning("DRY RUN / WALK-FORWARD — live public data, NO real orders")
+                log.warning("paper_equity=%s  starting_pnl=%s  (set via MM_PAPER_EQUITY / MM_START_PNL)",
+                            self._cfg.paper_equity, self._cfg.start_pnl)
+                log.warning("════════════════════════════════════════════════════")
+                # Simulated fills driven by the live public trades feed.
+                paper = PaperBroker(self._cfg, oms, risk)
+                for eng in engines.values():
+                    paper.on_fill(eng.on_fill)
+                public_ws = PublicWS(symbols, books, trade_cb=paper.on_trade)
+            else:
+                # ── cancel existing open orders ───────
+                log.info("Cancelling any existing open orders...")
+                await rest.cancel_all_symbols(symbols)
+                await asyncio.sleep(1.0)
 
-            # ── private WS ───────────────────────
-            private_ws = PrivateWS(self._cfg, oms, risk)
-            for eng in engines.values():
-                private_ws.on_fill(eng.on_fill)
+                # ── reconcile positions ───────────────
+                await reconcile(rest, risk, symbols)
 
-            # ── public WS ────────────────────────
-            public_ws = PublicWS(symbols, books)
+                # ── private WS ───────────────────────
+                private_ws = PrivateWS(self._cfg, oms, risk)
+                for eng in engines.values():
+                    private_ws.on_fill(eng.on_fill)
+
+                # ── public WS ────────────────────────
+                public_ws = PublicWS(symbols, books)
 
             # ── TTL reaper ────────────────────────
             reaper = TTLReaper(self._cfg, rest, oms, engines)
@@ -1199,7 +1319,6 @@ class MicroMM:
             # ── launch tasks ─────────────────────
             tasks = [
                 asyncio.create_task(public_ws.run(),  name="public_ws"),
-                asyncio.create_task(private_ws.run(), name="private_ws"),
                 asyncio.create_task(reaper.run(),     name="ttl_reaper"),
                 asyncio.create_task(
                     daily_reset_loop(risk),           name="daily_reset"),
@@ -1207,6 +1326,8 @@ class MicroMM:
                     heartbeat_loop(risk, rest, books, engines, symbols),
                     name="heartbeat"),
             ]
+            if private_ws is not None:
+                tasks.append(asyncio.create_task(private_ws.run(), name="private_ws"))
 
             # One ticker-loop task per symbol
             for sym in symbols:
@@ -1223,18 +1344,21 @@ class MicroMM:
             log.info("Shutdown signal received, cleaning up…")
 
         # ── teardown ──────────────────────────────
-        public_ws.shutdown  = True
-        private_ws.shutdown = True
+        public_ws.shutdown = True
+        if private_ws is not None:
+            private_ws.shutdown = True
 
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Final bulk cancel
+        # Final bulk cancel (no-op in dry run)
         log.info("Emergency cancel on all symbols…")
         async with aiohttp.ClientSession() as session:
             rest2 = GateRest(self._cfg, session)
             await rest2.cancel_all_symbols(symbols)
+            if paper is not None:
+                log.info("Paper run complete — simulated fills: %d", paper.fills)
             log.info(await risk.report())
 
         log.info("Shutdown complete.")
@@ -1245,7 +1369,9 @@ class MicroMM:
 # ─────────────────────────────────────────────
 async def _main() -> None:
     cfg = load_config()
-    if not cfg.api_key or not cfg.api_secret:
+    if cfg.dry_run:
+        log.info("Starting in DRY-RUN mode (no API keys required, no real orders).")
+    elif not cfg.api_key or not cfg.api_secret:
         log.warning("GATE_API_KEY / GATE_API_SECRET not set – running without auth")
     mm = MicroMM(cfg)
     await mm.start()
