@@ -33,13 +33,19 @@ ENVIRONMENT VARIABLES (all optional)
   GATE_API_KEY              API key
   GATE_API_SECRET           API secret
   MM_SYMBOLS                Comma-separated override, e.g. SHIB_USDT,PEPE_USDT
+  MM_MAX_SYMBOLS            Cap auto-discovered universe to top-N by volume (default 8)
   MM_NOTIONAL_USDT          Per-side order size in USDT (default 5.0)
   MM_PRICE_MIN              Min contract price to auto-discover (default 0.000001)
-  MM_PRICE_MAX              Max contract price to auto-discover (default 0.10)
+  MM_PRICE_MAX              Max contract price to auto-discover (default 0.01 = sub-penny)
   DAILY_LOSS_LIMIT_USDT     Halt threshold (default 3.00)
   EQUITY_FLOOR_USDT         Circuit-breaker floor (default 5.00)
   MAX_INVENTORY_CONTRACTS   Per-symbol cap (default 5000)
   LOG_LEVEL                 DEBUG / INFO / WARNING (default INFO)
+  MM_LOG_FILE               Rotating log path (default gate_micro_mm.log; "" disables)
+
+NOTE: There is no such thing as a "no-loss" strategy. Capital protection here is
+a HARD circuit-breaker (daily-loss halt + equity floor) plus maker-only/post-only
+quoting to capture the rebate — not a guarantee of profit. Trade at your own risk.
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ import hashlib
 import hmac
 import json
 import logging
+import logging.handlers
 import os
 import signal
 import time
@@ -62,13 +69,37 @@ import aiohttp
 import websockets
 
 # ─────────────────────────────────────────────
-#  Logging
+#  Logging  (console + rotating file)
 # ─────────────────────────────────────────────
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FILE  = os.getenv("MM_LOG_FILE", "gate_micro_mm.log")
+
+_fmt = logging.Formatter(
+    "%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+_handlers: List[logging.Handler] = []
+_console = logging.StreamHandler()
+_console.setFormatter(_fmt)
+_handlers.append(_console)
+
+# Rotating file handler: 10 MB × 5 backups. Disabled if MM_LOG_FILE="" or unwritable.
+if LOG_FILE:
+    try:
+        _file = logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        _file.setFormatter(_fmt)
+        _handlers.append(_file)
+    except OSError as exc:  # e.g. read-only FS in CI
+        _console.handle(logging.LogRecord(
+            "gate_mm", logging.WARNING, __file__, 0,
+            "File logging disabled (%s): %s", (LOG_FILE, exc), None))
+
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s  %(levelname)-7s  %(name)s  %(message)s",
-    datefmt="%H:%M:%S",
+    handlers=_handlers,
 )
 log = logging.getLogger("gate_mm")
 
@@ -92,9 +123,12 @@ class Config:
     api_key:    str
     api_secret: str
 
-    # Discovery
+    # Discovery — default ceiling is sub-penny (< 1 cent) micro contracts
     price_min: Decimal = Decimal(os.getenv("MM_PRICE_MIN", "0.000001"))
-    price_max: Decimal = Decimal(os.getenv("MM_PRICE_MAX", "0.10"))
+    price_max: Decimal = Decimal(os.getenv("MM_PRICE_MAX", "0.01"))
+
+    # Cap the auto-discovered universe to the top-N by 24h volume (5–10 tickers).
+    max_symbols: int = int(os.getenv("MM_MAX_SYMBOLS", "8"))
 
     # Symbols (None → auto-discover)
     symbols: Optional[List[str]] = None
@@ -1042,6 +1076,7 @@ async def discover_symbols(rest: GateRest, cfg: Config) -> Tuple[
         raise RuntimeError("Failed to fetch contract list from Gate.io")
 
     instruments: Dict[str, Instrument] = {}
+    volumes: Dict[str, Decimal] = {}
     for c in contracts:
         sym   = c.get("name", "")
         mark  = Decimal(str(c.get("mark_price", "0") or "0"))
@@ -1062,13 +1097,20 @@ async def discover_symbols(rest: GateRest, cfg: Config) -> Tuple[
             instruments[sym] = Instrument(
                 symbol=sym, tick=tick, lot=lot, mark=mark
             )
+            volumes[sym] = vol
 
+    # Rank by 24h volume (deepest books = best fill rate) and cap to top-N.
+    ranked = sorted(instruments.keys(), key=lambda s: volumes[s], reverse=True)
+    if cfg.max_symbols > 0:
+        ranked = ranked[: cfg.max_symbols]
+    instruments = {s: instruments[s] for s in ranked}
     symbols = sorted(instruments.keys())
-    log.info("Discovered %d micro contracts", len(symbols))
-    if log.isEnabledFor(logging.DEBUG):
-        for s in symbols:
-            inst = instruments[s]
-            log.debug("  %s  mark=%s  tick=%s", s, inst.mark, inst.tick)
+
+    log.info("Discovered %d micro contracts; trading top %d by 24h volume",
+             len(volumes), len(symbols))
+    for s in symbols:
+        log.info("  %-18s  mark=%s  tick=%s  vol24h=%.0f USDT",
+                 s, instruments[s].mark, instruments[s].tick, float(volumes[s]))
     return symbols, instruments
 
 
