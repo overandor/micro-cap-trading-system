@@ -1,0 +1,41 @@
+# systemd unit for the Gate.io micro market maker.
+#
+# Install:
+#   sudo useradd -r -s /usr/sbin/nologin gatemm || true
+#   sudo mkdir -p /opt/gate-mm /var/log/gate-mm
+#   sudo cp -r . /opt/gate-mm && sudo chown -R gatemm:gatemm /opt/gate-mm /var/log/gate-mm
+#   cd /opt/gate-mm && sudo -u gatemm python3 -m venv .venv && \
+#     sudo -u gatemm .venv/bin/pip install -r requirements.txt
+#   sudo cp deploy/gate-mm.env.example /etc/gate-mm.env   # then edit, chmod 600
+#   sudo cp deploy/gate-mm.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now gate-mm
+#
+# Watch:  journalctl -u gate-mm -f        Stop: sudo systemctl stop gate-mm
+
+[Unit]
+Description=Gate.io micro market maker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gatemm
+Group=gatemm
+WorkingDirectory=/opt/gate-mm
+EnvironmentFile=/etc/gate-mm.env
+ExecStart=/opt/gate-mm/.venv/bin/python /opt/gate-mm/gate_micro_mm.py
+Restart=on-failure
+RestartSec=5
+# SIGINT triggers the bot's graceful shutdown (cancels all orders, prints P&L)
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/log/gate-mm
+
+[Install]
+WantedBy=multi-user.target
