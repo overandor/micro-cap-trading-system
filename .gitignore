@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+gate_micro_mm.log*
+*.log
+.env

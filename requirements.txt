@@ -1,0 +1,7 @@
+# Runtime dependencies for gate_micro_mm.py (Gate.io micro market maker)
+aiohttp>=3.9,<4.0
+websockets>=12.0,<14.0
+
+# Used by micro_cap_trading_bot.py
+pandas>=2.0
+numpy>=1.24
